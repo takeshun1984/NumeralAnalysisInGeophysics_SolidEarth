@@ -1,3 +1,5 @@
 # NumeralAnalysisInGeophysics_SolidEarth
 
 東京大学理学部および理学系研究科の共通講義「地球物理数値解析／Numeral Analysis in Geophysics」の固体地球パートのサンプルコードのリポジトリです。
+
+差分法による地震波伝播シミュレーションコードはFortran版を先に作成し、Pythonに落とし込んでいます。
