@@ -331,8 +331,8 @@ program FDM2D_2nd_layered
 
                 it1 = IT/NSKIP
 
-                VWX(it1,is) = VX(ii,kk)
-                VWZ(it1,is) = VZ(ii,kk)
+                VWX(it1,is) =  VX(ii,kk)
+                VWZ(it1,is) = -VZ(ii,kk) ! Convert “up” to “positive”
             end do
         end if
 
