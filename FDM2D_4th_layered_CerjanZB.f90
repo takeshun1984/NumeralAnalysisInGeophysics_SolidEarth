@@ -30,7 +30,7 @@ program FDM2D_2nd_layered
     real(SP), parameter :: X0 = 40.0_SP
     real(SP), parameter :: Z0 = 15.0_SP
     integer , parameter :: I0 = int(X0/DX)
-    integer , parameter :: K0 = int(Z0/DZ)+KFS
+    integer , parameter :: K0 = int(Z0/DZ)+KFS !! truncated if Z0/DZ is not an integer (actual depth = (K0-KFS)*DZ)
     !! duration & rupture-starting time from simulation start
     real(SP), parameter :: T0 = 3.0_SP  
     real(SP), parameter :: TS = 0.0_SP 
@@ -135,7 +135,7 @@ program FDM2D_2nd_layered
             if( Z.le.ZT ) then
                 VP = 0.00_SP  ! km/s
                 VS = 0.00_SP  ! km/s 
-                RO = 1.001_SP ! g/cm3
+                RO = 0.001_SP ! g/cm3
             else if( Z.lt.3.00_SP ) then
                 VP = 5.50_SP
                 VS = 3.14_SP
@@ -179,7 +179,7 @@ program FDM2D_2nd_layered
         VS = sqrt(RIG(i,k)/RHO(i,k))
         VP = sqrt((LAM(i,k)+2.0_SP*RIG(i,k))/RHO(i,k))
         write(io,'(2F9.3,3ES12.3E3)') &
-            real(i-1)*dx, Z, VP, VS, RHO(i,k)
+            real(i)*dx, Z, VP, VS, RHO(i,k)
     end do
     end do
     close(io)
@@ -353,7 +353,7 @@ program FDM2D_2nd_layered
                 div = DXVX+DZVZ
                 rot = DXVZ-DZVX
                 write(io,'(2F9.3,4ES12.3E3)') &
-                    real(i-1)*dx, (k-1-KFS)*dz, VX(i,k), VZ(i,k), div, rot
+                    real(i)*dx, real(k-KFS)*dz, VX(i,k), VZ(i,k), div, rot
             end do
             end do
             close(io)
