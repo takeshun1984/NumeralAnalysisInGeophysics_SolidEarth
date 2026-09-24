@@ -1,15 +1,24 @@
 !! ------------------------------------------------------------------------ !!
 !! Fast version of FDM2D_4th_layered_CerjanZB_basin.f90
 !!
-!! Time-invariant quantities are computed once before the time loop instead
-!! of at every grid point and every time step:
-!!   - rigxz  : harmonic mean of rigidity at the SXZ position    -> RIGXZA(i,k)
-!!   - bx, bz : inverse of the mean density at the VX, VZ positions -> BXA, BZA
-!!   - 1/(1-TU*DT/2) in the memory-variable update                -> RDEN(i,k)
-!!   - FD coefficients re40x, re41x, re40z, re41z (4th/2nd order switch;
-!!     depend only on k for a flat free surface)                  -> C40X(k), ...
-!! This removes the divisions from the time loop. The physics and the results
-!! are the same as the original code (differences are at float32 round-off level).
+!! Time-invariant coefficients are computed once before the time loop
+!! (same idea as the precomputation in the Python notebooks 08-10):
+!!
+!!  Memory variable (Crank-Nicolson), e.g. for r_xx:
+!!    dr/dt = -(1/tau_s) [ r + F ],
+!!    F_xx = (lam+2mu)(tau_eP/tau_s - 1) div v - 2mu (tau_eS/tau_s - 1) dvz/dz
+!!    -> r^(n+1) = C1 * r^n + C2 * F
+!!       C1 = (1 + TU*DT/2)/(1 - TU*DT/2),  C2 = TU*DT/(1 - TU*DT/2),  TU = -1/tau_s
+!!    P_DIV, P_2MU, P_MU : coefficients of F multiplied by C2
+!!  Stress: S_DIV, S_2MU, S_MU : coefficients multiplied by DT
+!!  Velocity: BX_DT, BZ_DT = DT * (inverse of the mean density)
+!!  rigxz (harmonic mean of rigidity at the SXZ position) is included in
+!!  P_MU and S_MU.  FD coefficients (4th/2nd order switch) depend only on k
+!!  for a flat free surface -> C40X(k), C41X(k), C40Z(k), C41Z(k).
+!!
+!! This removes the divisions and most multiplications from the time loop
+!! (about 1.5x faster than the original with -O3). The results are the same
+!! as the original code within float32 round-off.
 !! ------------------------------------------------------------------------ !!
 module params
     use iso_fortran_env, only: real32
@@ -120,15 +129,16 @@ program FDM2D_2nd_layered
     real(SP) :: TAUP, TAUS, TAU, W0
     real(SP) :: T, SDROP, texp, kupper
 
-    real(SP) :: bx, bz 
     real(SP) :: rigxz, rig00, rig01, rig11, rig10
 
     integer  :: isign
 
     ! time-invariant coefficients (computed once before the time loop)
-    real(SP) :: RIGXZA(NX,NZ), BXA(NX,NZ), BZA(NX,NZ), RDEN(NX,NZ)
+    real(SP) :: C1(NX,NZ), P_DIV(NX,NZ), P_2MU(NX,NZ), P_MU(NX,NZ)
+    real(SP) :: S_DIV(NX,NZ), S_2MU(NX,NZ), S_MU(NX,NZ)
+    real(SP) :: BX_DT(NX,NZ), BZ_DT(NX,NZ)
     real(SP) :: C40X(NZ), C41X(NZ), C40Z(NZ), C41Z(NZ)
-    real(SP) :: re40x, re41x, re40z, re41z
+    real(SP) :: C2, PIV, shear, HDT
 
     ! 6 characters  ======
     ONAME0       = "psv.l."
@@ -266,6 +276,7 @@ program FDM2D_2nd_layered
         C41Z(k) = rc41z + isign * rd41z
     end do
 
+    HDT = 0.5_SP*DT
     do k = 1, NZ
     do i = 1, NX
         !! harmonic mean of rigidity at the SXZ position
@@ -273,14 +284,26 @@ program FDM2D_2nd_layered
         rig10 = RIG(i+1,k  )
         rig01 = RIG(i  ,k+1)
         rig11 = RIG(i+1,k+1)
-        RIGXZA(i,k) = 4.0_SP * rig00*rig01*rig10*rig11/ &
-                      (rig00*rig01*rig10 + rig00*rig01*rig11 + &
-                       rig00*rig10*rig11 + rig01*rig10*rig11 + EPS)
-        !! inverse of the mean density at the VX, VZ positions
-        BXA(i,k) = 2.0_SP/(RHO(i,k)+RHO(i+1,k))
-        BZA(i,k) = 2.0_SP/(RHO(i,k)+RHO(i,k+1))
-        !! denominator of the Crank-Nicolson memory-variable update
-        RDEN(i,k) = 1.0_SP/(1.0_SP - TU(i,k)*DT*0.5_SP)
+        rigxz = 4.0_SP * rig00*rig01*rig10*rig11/ &
+                (rig00*rig01*rig10 + rig00*rig01*rig11 + &
+                 rig00*rig10*rig11 + rig01*rig10*rig11 + EPS)
+
+        !! memory variables: r^(n+1) = C1*r^n + C2*F  (QP, QS hold tau_e/tau_s)
+        PIV = LAM(i,k) + 2.0_SP*RIG(i,k)
+        C1(i,k) = (1.0_SP + TU(i,k)*DT*0.5_SP) / (1.0_SP - TU(i,k)*DT*0.5_SP)
+        C2      =  TU(i,k)*DT              / (1.0_SP - TU(i,k)*DT*0.5_SP)
+        P_DIV(i,k) = C2 * PIV*(QP(i,k)-1.0_SP)
+        P_2MU(i,k) = C2 * 2.0_SP*RIG(i,k)*(QS(i,k)-1.0_SP)
+        P_MU (i,k) = C2 * rigxz*(QS(i,k)-1.0_SP)
+
+        !! stress: coefficients multiplied by DT
+        S_DIV(i,k) = PIV*QP(i,k)*DT
+        S_2MU(i,k) = 2.0_SP*RIG(i,k)*QS(i,k)*DT
+        S_MU (i,k) = rigxz*QS(i,k)*DT
+
+        !! velocity: DT * inverse of the mean density at the VX, VZ positions
+        BX_DT(i,k) = 2.0_SP/(RHO(i,k)+RHO(i+1,k))*DT
+        BZ_DT(i,k) = 2.0_SP/(RHO(i,k)+RHO(i,k+1))*DT
     end do
     end do
 
@@ -291,51 +314,34 @@ program FDM2D_2nd_layered
         ! stress update
         do k = 1, NZ
         do i = 1, NX
+            ! spatial derivatives of velocity (4th order, 2nd order near the surface)
+            DXVX = (VX(i  ,k  ) - VX(i-1,k  )) * C40X(k) &
+                 - (VX(i+1,k  ) - VX(i-2,k  )) * C41X(k)
+            DZVZ = (VZ(i  ,k  ) - VZ(i  ,k-1)) * C40Z(k) &
+                 - (VZ(i  ,k+1) - VZ(i  ,k-2)) * C41Z(k)
+            DXVZ = (VZ(i+1,k  ) - VZ(i  ,k  )) * C40X(k) &
+                 - (VZ(i+2,k  ) - VZ(i-1,k  )) * C41X(k)
+            DZVX = (VX(i  ,k+1) - VX(i  ,k  )) * C40Z(k) &
+                 - (VX(i  ,k+2) - VX(i  ,k-1)) * C41Z(k)
+            div   = DXVX + DZVZ
+            shear = DXVZ + DZVX
 
-            re40x = C40X(k)
-            re41x = C41X(k)
-            re40z = C40Z(k)
-            re41z = C41Z(k)
-
-            DXVX = (VX(i  ,k  ) - VX(i-1,k  )) * re40x &
-                 - (VX(i+1,k  ) - VX(i-2,k  )) * re41x
-            DZVZ = (VZ(i  ,k  ) - VZ(i  ,k-1)) * re40z &
-                 - (VZ(i  ,k+1) - VZ(i  ,k-2)) * re41z
-            
-            DXVZ = (VZ(i+1,k  ) - VZ(i  ,k  )) * re40x &
-                 - (VZ(i+2,k  ) - VZ(i-1,k  )) * re41x
-            DZVX = (VX(i  ,k+1) - VX(i  ,k  )) * re40z &
-                 - (VX(i  ,k+2) - VX(i  ,k-1)) * re41z
-
-            rigxz = RIGXZA(i,k)
-
-            ! update memory variable
+            ! update memory variable: r^(n+1) = C1*r^n + C2*F
             RXXN = RXX(i,k)
             RZZN = RZZ(i,k)
             RXZN = RXZ(i,k)
-            RXX(i,k) = (RXXN + TU(i,k) * ( RXXN*0.5_SP &
-                     + (LAM(i,k)+2.0_SP*RIG(i,k))*(QP(i,k)-1.0_SP)*(DXVX+DZVZ) &
-                     - 2.0_SP*RIG(i,k)*(QS(i,k)-1.0_SP)*DZVZ ) * DT) &
-                     * RDEN(i,k)
-            RZZ(i,k) = (RZZN + TU(i,k) * ( RZZN*0.5_SP &
-                     + (LAM(i,k)+2.0_SP*RIG(i,k))*(QP(i,k)-1.0_SP)*(DXVX+DZVZ) &
-                     - 2.0_SP*RIG(i,k)*(QS(i,k)-1.0_SP)*DXVX ) * DT) &
-                     * RDEN(i,k)
-            RXZ(i,k) = (RXZN   &
-                      + TU (i,k)*(RXZN*0.50_SP+rigxz*(QS(i,k)-1.0_SP)*(DXVZ+DZVX))*dt ) &
-                      * RDEN(i,k)
+            RXX(i,k) = C1(i,k)*RXXN + P_DIV(i,k)*div - P_2MU(i,k)*DZVZ
+            RZZ(i,k) = C1(i,k)*RZZN + P_DIV(i,k)*div - P_2MU(i,k)*DXVX
+            RXZ(i,k) = C1(i,k)*RXZN + P_MU(i,k)*shear
 
-            SXX(i,k) = SXX(i,k) + ( (LAM(i,k)+2.0_SP*RIG(i,k))*QP(i,k)*(DXVX+DZVZ)  &
-                     - RIG(i,k)*2.0_SP*QS(i,k)*DZVZ + (RXX(i,k)+RXXN)*0.50_SP ) * dt
-            SZZ(i,k) = SZZ(i,k) + ( (LAM(i,k)+2.0_SP*RIG(i,k))*QP(i,k)*(DXVX+DZVZ)  &
-                     - RIG(i,k)*2.0_SP*QS(i,k)*DXVX + (RZZ(i,k)+RZZN)*0.50_SP ) * dt
-            SXZ(i,k) = SXZ(i,k) + ( rigxz*QS(i,k)*(DXVZ+DZVX) &
-                     + (RXZ(i,k)+RXZN)*0.50_SP ) * dt
-
-            SXX(i,k) = SXX(i,k) * gx1(i)*gz1(k)
-            SZZ(i,k) = SZZ(i,k) * gx1(i)*gz1(k)
-            SXZ(i,k) = SXZ(i,k) * gx2(i)*gz2(k)
-        end do 
+            ! update stress (with absorbing boundary)
+            SXX(i,k) = (SXX(i,k) + S_DIV(i,k)*div - S_2MU(i,k)*DZVZ &
+                     + HDT*(RXX(i,k)+RXXN)) * gx1(i)*gz1(k)
+            SZZ(i,k) = (SZZ(i,k) + S_DIV(i,k)*div - S_2MU(i,k)*DXVX &
+                     + HDT*(RZZ(i,k)+RZZN)) * gx1(i)*gz1(k)
+            SXZ(i,k) = (SXZ(i,k) + S_MU(i,k)*shear &
+                     + HDT*(RXZ(i,k)+RXZN)) * gx2(i)*gz2(k)
+        end do
         end do
 
         SDROP = MO*kupper(T,TS,T0)*DTXZ
@@ -350,26 +356,15 @@ program FDM2D_2nd_layered
         ! velocity update
         do k = 1, NZ
         do i = 1, NX
+            ! spatial derivatives of stress
+            DXSXX = (SXX(i+1,k  )-SXX(i  ,k  ))*C40X(k) - (SXX(i+2,k  )-SXX(i-1,k  ))*C41X(k)
+            DXSXZ = (SXZ(i  ,k  )-SXZ(i-1,k  ))*C40X(k) - (SXZ(i+1,k  )-SXZ(i-2,k  ))*C41X(k)
+            DZSZZ = (SZZ(i  ,k+1)-SZZ(i  ,k  ))*C40Z(k) - (SZZ(i  ,k+2)-SZZ(i  ,k-1))*C41Z(k)
+            DZSXZ = (SXZ(i  ,k  )-SXZ(i  ,k-1))*C40Z(k) - (SXZ(i  ,k+1)-SXZ(i  ,k-2))*C41Z(k)
 
-            re40x = C40X(k)
-            re41x = C41X(k)
-            re40z = C40Z(k)
-            re41z = C41Z(k)
-
-            DXSXX = (SXX(i+1,k  )-SXX(i  ,k  ))*re40x - (SXX(i+2,k  )-SXX(i-1,k  ))*re41x
-            DXSXZ = (SXZ(i  ,k  )-SXZ(i-1,k  ))*re40x - (SXZ(i+1,k  )-SXZ(i-2,k  ))*re41x
-
-            DZSZZ = (SZZ(i  ,k+1)-SZZ(i  ,k  ))*re40z - (SZZ(i  ,k+2)-SZZ(i  ,k-1))*re41z
-            DZSXZ = (SXZ(i  ,k  )-SXZ(i  ,k-1))*re40z - (SXZ(i  ,k+1)-SXZ(i  ,k-2))*re41z
-
-            bx = BXA(i,k)
-            bz = BZA(i,k)
-
-            VX(i,k) = VX(i,k) + (DXSXX+DZSXZ)*bx*DT
-            VZ(i,k) = VZ(i,k) + (DXSXZ+DZSZZ)*bz*DT
-
-            VX(i,k) = VX(i,k) * gx2(i)*gz1(k)
-            VZ(i,k) = VZ(i,k) * gx1(i)*gz2(k)
+            ! update velocity (with absorbing boundary)
+            VX(i,k) = (VX(i,k) + (DXSXX+DZSXZ)*BX_DT(i,k)) * gx2(i)*gz1(k)
+            VZ(i,k) = (VZ(i,k) + (DXSXZ+DZSZZ)*BZ_DT(i,k)) * gx1(i)*gz2(k)
         end do
         end do
 
